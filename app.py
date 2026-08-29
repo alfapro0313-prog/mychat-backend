@@ -1,5 +1,5 @@
 """
-MYCHAT - self-hosted backend (FastAPI + SQLite).
+Randep - self-hosted backend (FastAPI + SQLite).
 No CodeWords dependency, no run limits.
 
 Run:
@@ -26,7 +26,7 @@ DB_PATH = os.environ.get("DB_PATH", "mychat.db")
 ADMIN_USERNAME = os.environ.get("ADMIN_USERNAME", "")
 ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD", "")
 
-app = FastAPI(title="MYCHAT API", version="1.0.0")
+app = FastAPI(title="Randep API", version="1.0.0")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -101,6 +101,10 @@ def init_db() -> None:
             username TEXT PRIMARY KEY,
             last_seen INTEGER NOT NULL
         );
+        CREATE TABLE IF NOT EXISTS banned (
+            username TEXT PRIMARY KEY,
+            until_ts INTEGER NOT NULL
+        );
         """
     )
     conn.commit()
@@ -126,7 +130,7 @@ def ensure_admin_user() -> None:
         else:
             conn.execute(
                 "INSERT INTO users(username, salt, password_hash, name, bio, photo, created_at) VALUES(?, ?, ?, ?, ?, '', ?)",
-                (username, salt, h, "Admin", "MYCHAT administrator", now_ms()),
+                (username, salt, h, "Admin", "Randep administrator", now_ms()),
             )
         conn.commit()
     finally:
@@ -155,6 +159,18 @@ def clean_username(u):
 
 def is_admin_user(username: str) -> bool:
     return bool(ADMIN_USERNAME) and clean_username(username) == clean_username(ADMIN_USERNAME)
+
+
+def ban_remaining_ms(conn, username: str) -> int:
+    row = conn.execute("SELECT until_ts FROM banned WHERE username = ?", (username,)).fetchone()
+    if not row:
+        return 0
+    remaining = row["until_ts"] - now_ms()
+    if remaining <= 0:
+        conn.execute("DELETE FROM banned WHERE username = ?", (username,))
+        conn.commit()
+        return 0
+    return remaining
 
 
 class Request(BaseModel):
@@ -189,6 +205,8 @@ def resolve_user(conn, token):
     if not row:
         return None
     u = row["username"]
+    if ban_remaining_ms(conn, u) > 0:
+        return None
     touch_online(conn, u)
     return u
 
@@ -237,6 +255,9 @@ def do_login(conn, req):
     h = hashlib.sha256((row["salt"] + password).encode("utf-8")).hexdigest()
     if h != row["password_hash"]:
         return {"ok": False, "error": "invalid_credentials"}
+    remaining = ban_remaining_ms(conn, username)
+    if remaining > 0:
+        return {"ok": False, "error": "banned", "banned_ms": remaining}
     token = secrets.token_hex(24)
     conn.execute("INSERT INTO sessions(token, username) VALUES(?, ?)", (token, username))
     touch_online(conn, username)
@@ -310,6 +331,15 @@ def do_get_conversations(conn, username):
         mrow = conn.execute("SELECT text, ts FROM messages WHERE pair = ? ORDER BY id DESC LIMIT 1", (pair(username, other),)).fetchone()
         out.append({**prof, "last_text": mrow["text"] if mrow else "", "last_ts": mrow["ts"] if mrow else 0})
     return out
+
+
+def do_delete_chat(conn, username, other):
+    other = clean_username(other)
+    if not other:
+        return {"ok": False, "error": "invalid_username"}
+    conn.execute("DELETE FROM chats WHERE username = ? AND other = ?", (username, other))
+    conn.commit()
+    return {"ok": True}
 
 
 def do_get_messages(conn, username, other):
@@ -421,6 +451,58 @@ def do_admin_complaints(conn, admin_token):
     return {"ok": True, "complaints": [{"from": r["from_user"], "target": r["target"], "text": r["text"], "ts": r["ts"]} for r in rows]}
 
 
+def do_my_complaints(conn, username):
+    """Same as do_admin_complaints, but authorized via the normal user token
+    when that user is the configured admin - no separate admin login needed."""
+    if not is_admin_user(username):
+        return {"ok": False, "error": "unauthorized"}
+    rows = conn.execute("SELECT from_user, target, text, ts FROM complaints ORDER BY id DESC").fetchall()
+    return {"ok": True, "complaints": [{"from": r["from_user"], "target": r["target"], "text": r["text"], "ts": r["ts"]} for r in rows]}
+
+
+def do_site_users(conn, username):
+    """List everyone who has ever visited/logged into the site (admin only, via normal token)."""
+    if not is_admin_user(username):
+        return {"ok": False, "error": "unauthorized"}
+    rows = conn.execute(
+        "SELECT u.username, u.name, u.photo, o.last_seen, b.until_ts "
+        "FROM users u LEFT JOIN online o ON o.username = u.username "
+        "LEFT JOIN banned b ON b.username = u.username "
+        "ORDER BY COALESCE(o.last_seen, 0) DESC"
+    ).fetchall()
+    now = now_ms()
+    out = []
+    for r in rows:
+        if clean_username(r["username"]) == clean_username(ADMIN_USERNAME):
+            continue
+        banned_ms = (r["until_ts"] - now) if r["until_ts"] and r["until_ts"] > now else 0
+        out.append({
+            "username": r["username"],
+            "name": r["name"],
+            "photo": r["photo"],
+            "last_seen": r["last_seen"] or 0,
+            "banned_ms": banned_ms,
+        })
+    return {"ok": True, "users": out}
+
+
+def do_ban_user(conn, username, target):
+    """Ban a user for 3 hours (admin only, via normal token)."""
+    if not is_admin_user(username):
+        return {"ok": False, "error": "unauthorized"}
+    target = clean_username(target)
+    if not target or target == clean_username(ADMIN_USERNAME):
+        return {"ok": False, "error": "invalid_username"}
+    until_ts = now_ms() + 3 * 60 * 60 * 1000
+    conn.execute(
+        "INSERT INTO banned(username, until_ts) VALUES(?, ?) ON CONFLICT(username) DO UPDATE SET until_ts = excluded.until_ts",
+        (target, until_ts),
+    )
+    conn.execute("DELETE FROM sessions WHERE username = ?", (target,))
+    conn.commit()
+    return {"ok": True}
+
+
 def do_admin_update_user(conn, admin_token, target, name, bio):
     if not check_admin(conn, admin_token):
         return {"ok": False, "error": "unauthorized"}
@@ -517,6 +599,26 @@ def main_endpoint(request: Request):
             if not u:
                 return {"ok": False, "error": "unauthorized"}
             return do_submit_complaint(conn, u, request.target, request.text)
+        if action == "my_complaints":
+            u = resolve_user(conn, request.token)
+            if not u:
+                return {"ok": False, "error": "unauthorized"}
+            return do_my_complaints(conn, u)
+        if action == "delete_chat":
+            u = resolve_user(conn, request.token)
+            if not u:
+                return {"ok": False, "error": "unauthorized"}
+            return do_delete_chat(conn, u, request.target)
+        if action == "site_users":
+            u = resolve_user(conn, request.token)
+            if not u:
+                return {"ok": False, "error": "unauthorized"}
+            return do_site_users(conn, u)
+        if action == "ban_user":
+            u = resolve_user(conn, request.token)
+            if not u:
+                return {"ok": False, "error": "unauthorized"}
+            return do_ban_user(conn, u, request.target)
         if action == "admin_login":
             return do_admin_login(conn, request.admin_username, request.password)
         if action == "admin_complaints":
@@ -530,7 +632,7 @@ def main_endpoint(request: Request):
 
 @app.get("/")
 def health():
-    return {"ok": True, "service": "MYCHAT API"}
+    return {"ok": True, "service": "Randep API"}
 
 
 init_db()
