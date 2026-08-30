@@ -1,5 +1,5 @@
 """
-Randep - self-hosted backend (FastAPI + SQLite).
+Randap - self-hosted backend (FastAPI + SQLite).
 No CodeWords dependency, no run limits.
 
 Run:
@@ -7,17 +7,23 @@ Run:
     uvicorn app:app --host 0.0.0.0 --port 8000
 
 Environment variables:
-    ADMIN_PASSWORD   (required) - admin panel password
-    ADMIN_USERNAME   (optional) - username that gets the red ADMIN badge
-    DB_PATH          (optional) - SQLite file path (default: mychat.db)
-    PORT             (optional) - port (default: 8000)
+    ADMIN_PASSWORD      (required) - admin panel password
+    ADMIN_USERNAME      (optional) - username that gets the red ADMIN badge
+    DB_PATH             (optional) - SQLite file path (default: mychat.db)
+    PORT                (optional) - port (default: 8000)
+    VAPID_PUBLIC_KEY    (optional) - enables web push notifications
+    VAPID_PRIVATE_KEY   (optional) - enables web push notifications
+    VAPID_CLAIM_EMAIL   (optional) - contact email for push service, default mailto:admin@example.com
 """
+import base64
 import hashlib
+import json
 import os
 import secrets
 import sqlite3
 import time
 
+import requests
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
@@ -25,8 +31,11 @@ from pydantic import BaseModel, Field
 DB_PATH = os.environ.get("DB_PATH", "mychat.db")
 ADMIN_USERNAME = os.environ.get("ADMIN_USERNAME", "")
 ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD", "")
+VAPID_PUBLIC_KEY = os.environ.get("VAPID_PUBLIC_KEY", "")
+VAPID_PRIVATE_KEY = os.environ.get("VAPID_PRIVATE_KEY", "")
+VAPID_CLAIM_EMAIL = os.environ.get("VAPID_CLAIM_EMAIL", "mailto:admin@example.com")
 
-app = FastAPI(title="Randep API", version="1.0.0")
+app = FastAPI(title="Randap API", version="1.0.0")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -106,6 +115,13 @@ def init_db() -> None:
             until_ts INTEGER NOT NULL,
             reason TEXT NOT NULL DEFAULT ''
         );
+        CREATE TABLE IF NOT EXISTS push_subs (
+            username TEXT NOT NULL,
+            endpoint TEXT NOT NULL,
+            p256dh TEXT NOT NULL,
+            auth TEXT NOT NULL,
+            PRIMARY KEY (username, endpoint)
+        );
         """
     )
     conn.commit()
@@ -131,7 +147,7 @@ def ensure_admin_user() -> None:
         else:
             conn.execute(
                 "INSERT INTO users(username, salt, password_hash, name, bio, photo, created_at) VALUES(?, ?, ?, ?, ?, '', ?)",
-                (username, salt, h, "Admin", "Randep administrator", now_ms()),
+                (username, salt, h, "Admin", "Randap administrator", now_ms()),
             )
         conn.commit()
     finally:
@@ -201,6 +217,9 @@ class Request(BaseModel):
     token: str | None = None
     admin_token: str | None = None
     admin_username: str | None = None
+    endpoint: str | None = None
+    p256dh: str | None = None
+    auth: str | None = None
 
 
 def touch_online(conn, username: str) -> None:
@@ -314,6 +333,104 @@ def do_search_users(conn, username, query):
     ]
 
 
+def _b64url_decode(s: str) -> bytes:
+    s = s + "=" * (-len(s) % 4)
+    return base64.urlsafe_b64decode(s)
+
+
+def _vapid_private_key():
+    from cryptography.hazmat.primitives.asymmetric import ec
+    raw = _b64url_decode(VAPID_PRIVATE_KEY)
+    priv_int = int.from_bytes(raw, "big")
+    return ec.derive_private_key(priv_int, ec.SECP256R1())
+
+
+def _vapid_headers(endpoint: str) -> dict:
+    import jwt as pyjwt
+    from urllib.parse import urlparse
+    parsed = urlparse(endpoint)
+    aud = f"{parsed.scheme}://{parsed.netloc}"
+    token = pyjwt.encode(
+        {"aud": aud, "exp": int(time.time()) + 12 * 3600, "sub": VAPID_CLAIM_EMAIL},
+        _vapid_private_key(),
+        algorithm="ES256",
+    )
+    if isinstance(token, bytes):
+        token = token.decode()
+    return {"Authorization": f"vapid t={token}, k={VAPID_PUBLIC_KEY}"}
+
+
+def _hkdf(salt: bytes, ikm: bytes, info: bytes, length: int) -> bytes:
+    from cryptography.hazmat.primitives import hashes
+    from cryptography.hazmat.primitives.kdf.hkdf import HKDF
+    return HKDF(algorithm=hashes.SHA256(), length=length, salt=salt, info=info).derive(ikm)
+
+
+def _encrypt_push_payload(p256dh_b64: str, auth_b64: str, plaintext: bytes) -> bytes:
+    from cryptography.hazmat.primitives.asymmetric import ec
+    from cryptography.hazmat.primitives import serialization
+    from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+
+    ua_public_bytes = _b64url_decode(p256dh_b64)
+    auth_secret = _b64url_decode(auth_b64)
+    ua_public_key = ec.EllipticCurvePublicKey.from_encoded_point(ec.SECP256R1(), ua_public_bytes)
+
+    as_private = ec.generate_private_key(ec.SECP256R1())
+    as_public_bytes = as_private.public_key().public_bytes(
+        serialization.Encoding.X962, serialization.PublicFormat.UncompressedPoint
+    )
+    shared_secret = as_private.exchange(ec.ECDH(), ua_public_key)
+
+    ikm = _hkdf(
+        salt=auth_secret,
+        ikm=shared_secret,
+        info=b"WebPush: info\x00" + ua_public_bytes + as_public_bytes,
+        length=32,
+    )
+
+    salt16 = os.urandom(16)
+    cek = _hkdf(salt=salt16, ikm=ikm, info=b"Content-Encoding: aes128gcm\x00", length=16)
+    nonce = _hkdf(salt=salt16, ikm=ikm, info=b"Content-Encoding: nonce\x00", length=12)
+
+    ciphertext = AESGCM(cek).encrypt(nonce, plaintext + b"\x02", None)
+    rs = 4096
+    header = salt16 + rs.to_bytes(4, "big") + len(as_public_bytes).to_bytes(1, "big") + as_public_bytes
+    return header + ciphertext
+
+
+def notify_user(conn, username, title, body, extra=None):
+    """Best-effort web push notification. Never raises - failures are silently ignored
+    so a broken/expired subscription never breaks message sending."""
+    if not VAPID_PRIVATE_KEY or not VAPID_PUBLIC_KEY:
+        return
+    rows = conn.execute("SELECT endpoint, p256dh, auth FROM push_subs WHERE username = ?", (username,)).fetchall()
+    if not rows:
+        return
+    payload = {"title": title, "body": body}
+    if extra:
+        payload.update(extra)
+    payload_bytes = json.dumps(payload).encode("utf-8")
+    dead = []
+    for r in rows:
+        try:
+            body_bytes = _encrypt_push_payload(r["p256dh"], r["auth"], payload_bytes)
+            headers = _vapid_headers(r["endpoint"])
+            headers.update({
+                "Content-Type": "application/octet-stream",
+                "Content-Encoding": "aes128gcm",
+                "TTL": "60",
+            })
+            resp = requests.post(r["endpoint"], data=body_bytes, headers=headers, timeout=8)
+            if resp.status_code in (404, 410):
+                dead.append(r["endpoint"])
+        except Exception:
+            pass
+    for ep in dead:
+        conn.execute("DELETE FROM push_subs WHERE endpoint = ?", (ep,))
+    if dead:
+        conn.commit()
+
+
 def do_send_message(conn, username, to, text):
     to = clean_username(to)
     if not to or to == username:
@@ -333,6 +450,14 @@ def do_send_message(conn, username, to, text):
         (to, username, ts),
     )
     conn.commit()
+    sender = get_profile(conn, username)
+    snippet = (text or "")[:120]
+    notify_user(conn, to, sender.get("name") or sender.get("username"), snippet, {
+        "from_username": sender.get("username"),
+        "from_name": sender.get("name"),
+        "from_photo": sender.get("photo"),
+        "url": "/",
+    })
     return {"ok": True}
 
 
@@ -635,6 +760,29 @@ def main_endpoint(request: Request):
             if not u:
                 return {"ok": False, "error": "unauthorized"}
             return do_ban_user(conn, u, request.target, request.text)
+        if action == "vapid_public_key":
+            return {"ok": True, "key": VAPID_PUBLIC_KEY}
+        if action == "save_push_subscription":
+            u = resolve_user(conn, request.token)
+            if not u:
+                return {"ok": False, "error": "unauthorized"}
+            if not request.endpoint or not request.p256dh or not request.auth:
+                return {"ok": False, "error": "invalid_request"}
+            conn.execute(
+                "INSERT INTO push_subs(username, endpoint, p256dh, auth) VALUES(?, ?, ?, ?) "
+                "ON CONFLICT(username, endpoint) DO UPDATE SET p256dh = excluded.p256dh, auth = excluded.auth",
+                (u, request.endpoint, request.p256dh, request.auth),
+            )
+            conn.commit()
+            return {"ok": True}
+        if action == "remove_push_subscription":
+            u = resolve_user(conn, request.token)
+            if not u:
+                return {"ok": False, "error": "unauthorized"}
+            if request.endpoint:
+                conn.execute("DELETE FROM push_subs WHERE username = ? AND endpoint = ?", (u, request.endpoint))
+                conn.commit()
+            return {"ok": True}
         if action == "admin_login":
             return do_admin_login(conn, request.admin_username, request.password)
         if action == "admin_complaints":
@@ -648,7 +796,7 @@ def main_endpoint(request: Request):
 
 @app.get("/")
 def health():
-    return {"ok": True, "service": "Randep API"}
+    return {"ok": True, "service": "Randap API"}
 
 
 init_db()
