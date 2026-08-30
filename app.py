@@ -103,7 +103,8 @@ def init_db() -> None:
         );
         CREATE TABLE IF NOT EXISTS banned (
             username TEXT PRIMARY KEY,
-            until_ts INTEGER NOT NULL
+            until_ts INTEGER NOT NULL,
+            reason TEXT NOT NULL DEFAULT ''
         );
         """
     )
@@ -171,6 +172,19 @@ def ban_remaining_ms(conn, username: str) -> int:
         conn.commit()
         return 0
     return remaining
+
+
+def ban_info(conn, username: str):
+    """Returns (remaining_ms, reason). Cleans up expired bans."""
+    row = conn.execute("SELECT until_ts, reason FROM banned WHERE username = ?", (username,)).fetchone()
+    if not row:
+        return 0, ""
+    remaining = row["until_ts"] - now_ms()
+    if remaining <= 0:
+        conn.execute("DELETE FROM banned WHERE username = ?", (username,))
+        conn.commit()
+        return 0, ""
+    return remaining, row["reason"] or ""
 
 
 class Request(BaseModel):
@@ -255,9 +269,9 @@ def do_login(conn, req):
     h = hashlib.sha256((row["salt"] + password).encode("utf-8")).hexdigest()
     if h != row["password_hash"]:
         return {"ok": False, "error": "invalid_credentials"}
-    remaining = ban_remaining_ms(conn, username)
+    remaining, reason = ban_info(conn, username)
     if remaining > 0:
-        return {"ok": False, "error": "banned", "banned_ms": remaining}
+        return {"ok": False, "error": "banned", "banned_ms": remaining, "reason": reason}
     token = secrets.token_hex(24)
     conn.execute("INSERT INTO sessions(token, username) VALUES(?, ?)", (token, username))
     touch_online(conn, username)
@@ -465,7 +479,7 @@ def do_site_users(conn, username):
     if not is_admin_user(username):
         return {"ok": False, "error": "unauthorized"}
     rows = conn.execute(
-        "SELECT u.username, u.name, u.photo, o.last_seen, b.until_ts "
+        "SELECT u.username, u.name, u.photo, o.last_seen, b.until_ts, b.reason "
         "FROM users u LEFT JOIN online o ON o.username = u.username "
         "LEFT JOIN banned b ON b.username = u.username "
         "ORDER BY COALESCE(o.last_seen, 0) DESC"
@@ -482,11 +496,12 @@ def do_site_users(conn, username):
             "photo": r["photo"],
             "last_seen": r["last_seen"] or 0,
             "banned_ms": banned_ms,
+            "ban_reason": r["reason"] if banned_ms > 0 else "",
         })
     return {"ok": True, "users": out}
 
 
-def do_ban_user(conn, username, target):
+def do_ban_user(conn, username, target, reason):
     """Ban a user for 3 hours (admin only, via normal token)."""
     if not is_admin_user(username):
         return {"ok": False, "error": "unauthorized"}
@@ -495,8 +510,9 @@ def do_ban_user(conn, username, target):
         return {"ok": False, "error": "invalid_username"}
     until_ts = now_ms() + 3 * 60 * 60 * 1000
     conn.execute(
-        "INSERT INTO banned(username, until_ts) VALUES(?, ?) ON CONFLICT(username) DO UPDATE SET until_ts = excluded.until_ts",
-        (target, until_ts),
+        "INSERT INTO banned(username, until_ts, reason) VALUES(?, ?, ?) "
+        "ON CONFLICT(username) DO UPDATE SET until_ts = excluded.until_ts, reason = excluded.reason",
+        (target, until_ts, (reason or "")[:300]),
     )
     conn.execute("DELETE FROM sessions WHERE username = ?", (target,))
     conn.commit()
@@ -618,7 +634,7 @@ def main_endpoint(request: Request):
             u = resolve_user(conn, request.token)
             if not u:
                 return {"ok": False, "error": "unauthorized"}
-            return do_ban_user(conn, u, request.target)
+            return do_ban_user(conn, u, request.target, request.text)
         if action == "admin_login":
             return do_admin_login(conn, request.admin_username, request.password)
         if action == "admin_complaints":
